@@ -89,6 +89,7 @@ ALL_COLUMNS = [
 
 # Pair-acquisition products: granule name contains two cycle numbers and four timestamps.
 _PAIR_PRODUCTS = frozenset({"RIFG", "RUNW", "GUNW", "ROFF", "GOFF"})
+_SINGLE_PRODUCTS = frozenset({"RSLC", "GSLC", "GCOV", "SME2"})
 
 GROUP_REQUIRED = [
     "mission",
@@ -943,9 +944,9 @@ def myargsparse(a):
     cf = p.add_argument_group("Column / metadata filters (all accept one or more values)")
     cf.add_argument("--bucket", nargs="*", metavar="TEXT", help="S3 bucket name(s). Supports LIKE wildcards (%%).")
     cf.add_argument("--mission", nargs="*", metavar="CODE", help="Mission code(s) (e.g. NISAR)")
-    cf.add_argument("--inst_level", nargs="*", metavar="CODE", help="Processing level(s) (e.g. L1 L2)")
+    cf.add_argument("--inst_level", nargs="*", metavar="CODE", help="Instrument (L-band) and Processing level(s) (e.g. L1 L2)")
     cf.add_argument("--proctype", nargs="*", metavar="CODE", help="Processing type(s)")
-    cf.add_argument("--product", nargs="*", metavar="CODE", help="Product type(s) (e.g. GCOV RSLC GSLC GUNW)")
+    cf.add_argument("--product", nargs="*", metavar="CODE", help="Product type(s) (e.g. GCOV RSLC GSLC SME2 RIFG RUNW GUNW ROFF GOFF)")
     cf.add_argument("--short_name", nargs="*", metavar="NAME", help="CMR short name(s) – overrides auto-construction from " "--inst_level + --product.  E.g. NISAR_L2_GCOV")
     cf.add_argument("--cycle", nargs="*", type=int, metavar="INT", help="Reference cycle number(s)")
     cf.add_argument("--cycle2", nargs="*", type=int, metavar="INT", help="Secondary cycle number(s) for pair-acquisition products " "(RIFG, RUNW, GUNW, ROFF, GOFF).  In the granule name SCY sits between FRM and MODE.")

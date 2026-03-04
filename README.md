@@ -16,3 +16,24 @@ eval $(seppo_earthaccess_credentials.py -s)
 
 Use this program to run a search for NISAR products available through earthaccess
 
+Example to get the complete collection of GCOV data as a geojson file:
+```
+seppo_nisar_earthaccess_search.py --product GCOV --format geojson --output gcov.geojson
+```
+
+## Requirements
+
+You need the `earthaccess` package from conda-forge
+
+PIP:
+```
+pip install earthaccess
+```
+
+Mamba or Conda:
+```
+mamba install -c conda-forge earthaccess
+#OR
+conda install -c conda-forge earthaccess
+```
+
