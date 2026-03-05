@@ -83,7 +83,7 @@ in QGIS add a raster file by using this pattern
 
 `NETCDF:/vsis3/<s3url without the s3:// prefix>`
 
-This will open a dialog to pick the h5 variables to load. Note that frequency A takes a while, wheras frequency B HHHH or HVHV for example display rather quickly.
+This will open a dialog to pick the h5 variables to load. Note that frequency A takes a while, whereas frequency B HHHH or HVHV for example display rather quickly.
 
 
 
