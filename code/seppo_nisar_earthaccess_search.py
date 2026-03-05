@@ -3,7 +3,8 @@
 seppo_nisar_earthaccess_search.py
 **********************************
 Software for Earth big data Processing, Prediction, and Organization
-(c) 2016-today Earth Big Data LLC
+
+(c) 2026 Earth Big Data
 
 Author: Josef Kellndorfer
 Date: 2026-02-28
