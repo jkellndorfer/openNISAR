@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 """Set and unset temporary NASA Earthaccess AWS envtironment variables
 
+(c) 2026 Earth Big Data
+
 Usage:
 
 # Set credentials:
