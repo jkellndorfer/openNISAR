@@ -296,49 +296,55 @@ def _parse_dt(val):
     return None
 
 
-# ─── earthaccess geometry / granule helpers ────────────────────────────────────
+# ─── CMR direct query helpers ──────────────────────────────────────────────────
+
+# CMR granule search is a public API — no authentication required.
+CMR_GRANULE_URL = "https://cmr.earthdata.nasa.gov/search/granules.json"
 
 
-def _granule_to_geom(granule):
-    """Extract footprint from an earthaccess DataGranule as a GeoJSON geometry dict."""
-    try:
-        spatial = granule["umm"].get("SpatialExtent", {}).get("HorizontalSpatialDomain", {}).get("Geometry", {})
-        if "GPolygons" in spatial:
-            pts = spatial["GPolygons"][0]["Boundary"]["Points"]
-            coords = [[p["Longitude"], p["Latitude"]] for p in pts]
-            if coords and coords[0] != coords[-1]:
-                coords.append(coords[0])
-            return {"type": "Polygon", "coordinates": [coords]}
-        if "BoundingRectangles" in spatial:
-            br = spatial["BoundingRectangles"][0]
-            w, e = br["WestBoundingCoordinate"], br["EastBoundingCoordinate"]
-            n, s = br["NorthBoundingCoordinate"], br["SouthBoundingCoordinate"]
-            coords = [[w, n], [e, n], [e, s], [w, s], [w, n]]
-            return {"type": "Polygon", "coordinates": [coords]}
-    except (KeyError, IndexError, TypeError):
-        pass
+def _cmr_entry_to_geom(entry):
+    """Extract footprint from a CMR JSON granule entry as a GeoJSON geometry dict.
+
+    CMR polygon rings are strings of space-separated 'lat lon' pairs.
+    CMR bounding boxes are strings of 'S W N E'.
+    """
+    if entry.get("polygons"):
+        tokens = entry["polygons"][0][0].split()
+        coords = [[float(tokens[i + 1]), float(tokens[i])] for i in range(0, len(tokens) - 1, 2)]
+        if coords and coords[0] != coords[-1]:
+            coords.append(coords[0])
+        return {"type": "Polygon", "coordinates": [coords]}
+    if entry.get("boxes"):
+        s, w, n, e = [float(v) for v in entry["boxes"][0].split()]
+        return {"type": "Polygon", "coordinates": [[[w, n], [e, n], [e, s], [w, s], [w, n]]]}
     return None
 
 
-def _granule_to_records(granule):
-    """Convert an earthaccess DataGranule to a list of record dicts (one per .h5 file).
+def _cmr_entry_to_records(entry):
+    """Convert a CMR JSON granule entry to a list of record dicts (one per .h5 file).
 
     Every record contains both url (s3://) and url_https fields so the caller
     can choose which to emit without re-querying.
     """
-    s3_links = [x for x in granule.data_links(access="direct") if x.endswith(".h5")]
-    https_links = [x for x in granule.data_links(access="external") if x.endswith(".h5")]
+    gname = entry.get("producer_granule_id") or entry.get("title", "")
+    parsed = _parse_nisar_granule_name(gname)
+    geom = _cmr_entry_to_geom(entry)
 
-    # Normalise to the same length (typically 1:1)
+    s3_links, https_links = [], []
+    for lnk in entry.get("links", []):
+        href = lnk.get("href", "")
+        if not href.endswith(".h5"):
+            continue
+        if href.startswith("s3://") or "s3#" in lnk.get("rel", ""):
+            s3_links.append(href)
+        elif href.startswith("https://"):
+            https_links.append(href)
+
     n = max(len(s3_links), len(https_links))
     if n == 0:
         return []
     s3_links = s3_links + [None] * (n - len(s3_links))
     https_links = https_links + [None] * (n - len(https_links))
-
-    gname = granule["umm"].get("GranuleUR", "")
-    parsed = _parse_nisar_granule_name(gname)
-    geom = _granule_to_geom(granule)
 
     records = []
     for s3_url, https_url in zip(s3_links, https_links):
@@ -366,11 +372,9 @@ def _granule_to_records(granule):
             "url_https": https_url,
             "_geom": geom,
         }
-        # Fields present only in pair products
         for _k in ("cycle2", "start_time2", "end_time2"):
             if _k in parsed:
                 rec[_k] = parsed[_k]
-        # Fields present only in single products
         if "observation_mode" in parsed:
             rec["observation_mode"] = parsed["observation_mode"]
         records.append(rec)
@@ -459,7 +463,11 @@ def _build_granule_name_pattern(args):
         tokens.append(t)
     else:
         tokens.append("*")
-    if set(tokens) == {""}:
+    # tokens[0] is product; short_name already covers collection/product filtering.
+    # Only send granule_name to CMR when at least one other field (cycle, track,
+    # direction, frame, mode, polarization) has a specific value — otherwise the
+    # all-wildcard pattern forces expensive server-side regex on every granule name.
+    if not any(t and t != "*" for t in tokens[1:]):
         return None
     return "NISAR*" + "".join(f"_{tok}" for tok in tokens) + "*"
 
@@ -505,66 +513,101 @@ def _build_cmr_spatial(args):
 
 
 def search_earthaccess(args):
-    """Search NISAR products via NASA CMR using earthaccess.
+    """Search NISAR products via direct CMR HTTP query.
 
-    Builds the CMR kwargs first so --dryrun works without logging in.
+    CMR granule search is a public API — no Earthdata authentication required.
+    Uses the requests library (a transitive dependency of earthaccess).
     Returns a list of record dicts.
     """
-    if not HAS_EARTHACCESS:
-        print("Error: 'earthaccess' is not installed.  Install with:  conda install -c conda-forge earthaccess", file=sys.stderr)
+    try:
+        import requests as _requests
+    except ImportError:
+        print("Error: 'requests' is not installed. Install with: pip install requests", file=sys.stderr)
         sys.exit(1)
 
-    # Build kwargs before login so --dryrun never requires credentials
-    kwargs = {}
+    # ── Build short_names list ─────────────────────────────────────────────────
+    short_names = list(args.short_name) if args.short_name else _build_short_names(args)
+    if not short_names:
+        short_names = [None]  # fall back to provider-level search
 
-    # CMR requires a collection constraint (short_name / provider / …).
-    if args.short_name:
-        kwargs["short_name"] = list(args.short_name)
-    else:
-        short_names = _build_short_names(args)
-        if short_names:
-            kwargs["short_name"] = short_names
-        else:
-            kwargs["provider"] = "ASF"
+    # ── Build base CMR params ──────────────────────────────────────────────────
+    base_params = {}
 
-    # Add granule-name pattern as an additional CMR filter when track/frame/cycle
-    # are given as single values.  CMR ANDs this with the short_name constraint,
-    # so it narrows results within the collection without a Python post-filter round-trip.
     pattern = _build_granule_name_pattern(args)
     if pattern:
-        kwargs["granule_name"] = pattern
+        base_params["producer_granule_id"] = pattern
+        base_params["options[producer_granule_id][pattern]"] = "true"
 
     if args.start_time_after and args.start_time_before:
-        kwargs["temporal"] = (args.start_time_after, args.start_time_before)
+        base_params["temporal"] = f"{args.start_time_after},{args.start_time_before}"
     elif args.start_time_after:
-        kwargs["temporal"] = (args.start_time_after, None)
+        base_params["temporal"] = f"{args.start_time_after},"
     elif args.start_time_before:
-        kwargs["temporal"] = (None, args.start_time_before)
+        base_params["temporal"] = f",{args.start_time_before}"
 
-    kwargs.update(_build_cmr_spatial(args))
+    spatial = _build_cmr_spatial(args)
+    if "point" in spatial:
+        lon, lat = spatial["point"]
+        base_params["point"] = f"{lon},{lat}"
+    elif "bounding_box" in spatial:
+        base_params["bounding_box"] = ",".join(str(v) for v in spatial["bounding_box"])
+    elif "polygon" in spatial:
+        base_params["polygon"] = ",".join(f"{lon},{lat}" for lon, lat in spatial["polygon"])
+    elif "circle" in spatial:
+        lon, lat, r = spatial["circle"]
+        base_params["circle"] = f"{lon},{lat},{r:.0f}"
+
+    if not short_names[0]:
+        base_params["provider"] = "ASF"
 
     count = args.limit if (args.limit and args.limit > 0) else -1
 
     if args.verbose or args.dryrun:
-        print("--- earthaccess.search_data ---", file=sys.stderr)
-        print(f"  kwargs: {kwargs}", file=sys.stderr)
+        print("--- CMR direct query ---", file=sys.stderr)
+        print(f"  short_names: {short_names}", file=sys.stderr)
+        print(f"  params: {base_params}", file=sys.stderr)
         print(f"  count:  {count}", file=sys.stderr)
         print(file=sys.stderr)
 
     if args.dryrun:
         return []
 
-    # Login: tries netrc file first, falls back to interactive prompt
-    earthaccess.login()
+    # ── Query CMR, try each short_name in order, stop on first results ─────────
+    entries = []
+    for sn in short_names:
+        params = dict(base_params)
+        if sn:
+            params["short_name"] = sn
+        params["page_size"] = min(2000, count) if count > 0 else 2000
 
-    granules = earthaccess.search_data(count=count, **kwargs)
+        sn_entries = []
+        page_num = 1
+        while True:
+            params["page_num"] = page_num
+            resp = _requests.get(CMR_GRANULE_URL, params=params, timeout=60)
+            resp.raise_for_status()
+            page_entries = resp.json()["feed"]["entry"]
+            sn_entries.extend(page_entries)
+            cmr_hits = int(resp.headers.get("CMR-Hits", 0))
+            if args.verbose:
+                print(f"  short_name={sn!r} page {page_num}: {len(page_entries)} entries (CMR-Hits={cmr_hits})", file=sys.stderr)
+            if count > 0 and len(sn_entries) >= count:
+                sn_entries = sn_entries[:count]
+                break
+            if len(sn_entries) >= cmr_hits:
+                break
+            page_num += 1
+
+        if sn_entries:
+            entries = sn_entries
+            break  # BETA collection found results; skip operational fallback
 
     if args.verbose:
-        print(f"CMR returned {len(granules)} granule(s).", file=sys.stderr)
+        print(f"CMR returned {len(entries)} granule(s).", file=sys.stderr)
 
     records = []
-    for g in granules:
-        records.extend(_granule_to_records(g))
+    for entry in entries:
+        records.extend(_cmr_entry_to_records(entry))
     return records
 
 
@@ -887,6 +930,8 @@ def myargsparse(a):
 
     epilog = f"""
 \nExamples:
+\r  NOTE: --product GCOV is the default.
+ 
 
 \r  All GCOV URLs for ascending track 64 (latest CRID, s3):
 \r    {thisprog} --product GCOV --track 64 --direction A
@@ -947,7 +992,7 @@ def myargsparse(a):
     cf.add_argument("--mission", nargs="*", metavar="CODE", help="Mission code(s) (e.g. NISAR)")
     cf.add_argument("--inst_level", nargs="*", metavar="CODE", help="Instrument (L-band) and Processing level(s) (e.g. L1 L2)")
     cf.add_argument("--proctype", nargs="*", metavar="CODE", help="Processing type(s)")
-    cf.add_argument("--product", nargs="*", metavar="CODE", help="Product type(s) (e.g. GCOV RSLC GSLC SME2 RIFG RUNW GUNW ROFF GOFF)")
+    cf.add_argument("--product", nargs="+", required=False, default=["GCOV"], metavar="CODE", help="Product type(s) (e.g. GCOV RSLC GSLC SME2 RIFG RUNW GUNW ROFF GOFF)", choices=sorted(_SINGLE_PRODUCTS.union(_PAIR_PRODUCTS)))
     cf.add_argument("--short_name", nargs="*", metavar="NAME", help="CMR short name(s) – overrides auto-construction from " "--inst_level + --product.  E.g. NISAR_L2_GCOV")
     cf.add_argument("--cycle", nargs="*", type=int, metavar="INT", help="Reference cycle number(s)")
     cf.add_argument("--cycle2", nargs="*", type=int, metavar="INT", help="Secondary cycle number(s) for pair-acquisition products " "(RIFG, RUNW, GUNW, ROFF, GOFF).  In the granule name SCY sits between FRM and MODE.")
